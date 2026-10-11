@@ -1,8 +1,8 @@
 /**
- * AirBeam P2P - WebRTC Signaling Server
+ * AirBeam P2P - WebSocket Signaling & Relay Server
  * 
- * Production-ready WebSocket signaling server for peer-to-peer file transfer.
- * Handles room creation, session code pairing, and chunk/metadata relay.
+ * Handles room creation, session code pairing, and transparent relay of
+ * both JSON control messages and binary file chunks between Android Sender and Web Receiver.
  */
 
 const http = require('http');
@@ -16,11 +16,9 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
-
-// Serve static public folder if exists
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Root status page
+// Root status dashboard
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -36,9 +34,9 @@ app.get('/', (req, res) => {
         <div class="w-16 h-16 rounded-2xl bg-sky-500/20 text-sky-400 flex items-center justify-center mx-auto text-2xl font-bold">
           🛰️
         </div>
-        <h1 class="text-xl font-bold text-white">AirBeam Signaling Server</h1>
+        <h1 class="text-xl font-bold text-white">AirBeam Signaling & Relay Server</h1>
         <p class="text-xs text-slate-400">
-          WebSocket signaling server is online and active. Your Android P2P app is connected to this backend for WebRTC session pairing.
+          Server is online and actively relaying file chunks between Android Sender and Web Receiver.
         </p>
         <div class="pt-2">
           <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-semibold border border-emerald-500/20">
@@ -72,7 +70,20 @@ wss.on('connection', (ws) => {
 
   ws.on('pong', () => { ws.isAlive = true; });
 
-  ws.on('message', (data) => {
+  ws.on('message', (data, isBinary) => {
+    // 1. Handle binary file chunks (Buffer)
+    if (isBinary || Buffer.isBuffer(data)) {
+      const room = rooms.get(ws.roomCode);
+      if (room) {
+        const target = ws.role === 'sender' ? room.receiver : room.sender;
+        if (target && target.readyState === WebSocket.OPEN) {
+          target.send(data);
+        }
+      }
+      return;
+    }
+
+    // 2. Handle JSON signaling messages
     try {
       const message = JSON.parse(data.toString());
       switch (message.type) {
@@ -82,11 +93,29 @@ wss.on('connection', (ws) => {
           ws.roomCode = code;
           ws.role = 'sender';
           sendTo(ws, { type: 'room-created', code });
-          console.log(`Room created: ${code}`);
+          console.log(`[Room Created] Code: ${code}`);
           break;
         }
+
+        case 'join-room': {
+          const code = message.code;
+          const room = rooms.get(code);
+          if (room && room.sender && room.sender.readyState === WebSocket.OPEN) {
+            room.receiver = ws;
+            ws.roomCode = code;
+            ws.role = 'receiver';
+            sendTo(ws, { type: 'room-joined', code });
+            sendTo(room.sender, { type: 'peer-joined', code });
+            console.log(`[Room Paired] Code: ${code}`);
+          } else {
+            sendTo(ws, { type: 'error', message: 'Invalid or expired session code.' });
+          }
+          break;
+        }
+
         case 'file-meta':
-        case 'file-end': {
+        case 'file-end':
+        case 'file-cancel': {
           const room = rooms.get(ws.roomCode);
           if (room) {
             const target = ws.role === 'sender' ? room.receiver : room.sender;
@@ -94,6 +123,7 @@ wss.on('connection', (ws) => {
           }
           break;
         }
+
         default: {
           const room = rooms.get(ws.roomCode);
           if (room) {
@@ -104,12 +134,17 @@ wss.on('connection', (ws) => {
         }
       }
     } catch (err) {
-      console.error('Message error:', err);
+      console.error('[Message Error]', err);
     }
   });
 
   ws.on('close', () => {
     if (ws.roomCode) {
+      const room = rooms.get(ws.roomCode);
+      if (room) {
+        const target = ws.role === 'sender' ? room.receiver : room.sender;
+        sendTo(target, { type: 'peer-disconnected', message: 'Peer disconnected.' });
+      }
       rooms.delete(ws.roomCode);
     }
   });
@@ -125,5 +160,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`AirBeam Signaling Server running on port ${PORT}`);
+  console.log(`AirBeam Relay Server running on port ${PORT}`);
 });
